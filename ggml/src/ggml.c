@@ -37,6 +37,10 @@
 #include <unistd.h>
 #endif
 
+#ifdef GGML_USE_ONEDNN
+#include "ggml-onednn.h"
+#endif
+
 #if defined(__ARM_FEATURE_SVE) || defined(__ARM_FEATURE_MATMUL_INT8)
 #undef GGML_USE_LLAMAFILE
 #endif
@@ -12178,6 +12182,19 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
+void get_errors(float * vals1, float * vals2, size_t num){
+    float accum = 0;
+    for (size_t i = 0; i < num; i++){
+        accum += ((vals1[i] - vals2[i]) * (vals1[i] - vals2[i]));// / abs(vals1[i]);
+        
+        // horrible hack
+        //float ratio = 2.0/3.0;
+        //vals1[i] = ratio * vals1[i] + (1 - ratio) * vals2[i];
+    }
+    float res = sqrtf(accum / num);
+    printf("oneDNN matmul error: %f\n\n", res);
+}
+
 static void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -12219,13 +12236,40 @@ static void ggml_compute_forward_mul_mat(
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows
 
+#if GGML_USE_ONEDNN
+    static int totalRuns = 0;
+    static int onednnUsed = 0;
+    
+    totalRuns++;
+    
+    bool calcError = false;
+    size_t totalElems = dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3];
+    float * dnnBuff = malloc(sizeof(float) * totalElems);
+    void * buffBckp = dst->data;
+    //dst->data = dnnBuff;
+    
+    if (ggml_try_onednn_mul_mat(src0, src1, dst, ith, nth)){
+        //printf("weights name, dims: %s, %d x %d x %d x %d, %d x %d x %d x %d\n", src0->name, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3]);
+        onednnUsed++;
+        calcError = true;
+        return;
+    }
+    
+    dst->data = buffBckp;
+    
+    //calcError = false;
+    
+    /*if (totalRuns % 20 == 0)
+        printf("\noneDNN usage: %f%\n", 100.0f * onednnUsed / totalRuns);*/
+#endif
+
 #if GGML_USE_LLAMAFILE
     // broadcast factors
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
 
     const bool src1_cont = ggml_is_contiguous(src1);
-
+    
     if (src1_cont) {
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
@@ -12239,8 +12283,10 @@ static void ggml_compute_forward_mul_mat(
                                      ith, nth,
                                      src0->type,
                                      src1->type,
-                                     dst->type))
+                                     dst->type)){
                     goto UseGgmlGemm1;
+                 }
+         if (calcError) get_errors(dst->data, dnnBuff, totalElems);
         return;
     }
 UseGgmlGemm1:;
@@ -12255,6 +12301,9 @@ UseGgmlGemm1:;
 
         assert(params->wsize >= ne13*nbw3);
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        
+        size_t totalElems = ne10 * ne11 * ne12 * ne13;
+        size_t weirds = 0;
 
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
@@ -12271,9 +12320,17 @@ UseGgmlGemm1:;
                     from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
                            (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
                            ne10);
+                    
+                    // HERE HERE HERE
+                   for (int64_t i10 = 0; i10 < ne10; i10++){
+                       int8_t * basePtr = (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1);
+                       if (basePtr[i10] == -128 || basePtr[i10] == 127 || basePtr[i10] == 0) weirds++;
+                   }
                 }
             }
         }
+        
+        //printf("from_float input quants weirds % weirds % = %f\n", 100.0 * 32 / totalElems, 100.0 * weirds / totalElems);
     }
 
     if (ith == 0) {
@@ -12289,7 +12346,7 @@ UseGgmlGemm1:;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
         for (int64_t i13 = 0; i13 < ne13; i13++)
-            for (int64_t i12 = 0; i12 < ne12; i12++)
+            for (int64_t i12 = 0; i12 < ne12; i12++){
                 if (!llamafile_sgemm(ne01, ne11, ne00/ggml_blck_size(src0->type),
                                      (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
                                      nb01/ggml_type_size(src0->type),
@@ -12301,7 +12358,9 @@ UseGgmlGemm1:;
                                      src0->type,
                                      vec_dot_type,
                                      dst->type))
-                    goto UseGgmlGemm2;
+                goto UseGgmlGemm2;
+            }
+        if (calcError) get_errors(dst->data, dnnBuff, totalElems);
         return;
     }
 UseGgmlGemm2:;
@@ -12367,6 +12426,7 @@ UseGgmlGemm2:;
                  (const char *) src0->data + src0_start * nb01, (const char *) src1_wdata + (src1_col_stride * iter), 1,
                  src0_end - src0_start);
         }
+        if (calcError) get_errors(dst->data, dnnBuff, totalElems);
         return;
     }
 
@@ -12391,6 +12451,7 @@ UseGgmlGemm2:;
 
         current_chunk = atomic_fetch_add(&params->shared->current_chunk, 1);
     }
+    if (calcError) get_errors(dst->data, dnnBuff, totalElems);
 }
 
 // ggml_compute_forward_mul_mat_id
@@ -16055,6 +16116,8 @@ static void ggml_compute_forward_unary(
         struct ggml_tensor * dst) {
 
     const enum ggml_unary_op op = ggml_get_unary_op(dst);
+    
+    //printf("Unary op num: %d\n", op);
 
     switch (op) {
         case GGML_UNARY_OP_ABS:
@@ -16633,6 +16696,23 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     if (tensor->op == GGML_OP_NONE || ggml_is_empty(tensor)) {
         return;
     }
+    
+    const struct ggml_tensor * t0 = tensor->src[0];
+    const struct ggml_tensor * t1 = tensor->src[1];
+    const struct ggml_tensor * t2 = tensor;
+    
+    /*if (t1 == NULL){
+        printf("dst_type: %d, src_type: %d\n", t2->type, t0->type);
+    }else{
+        printf("dst_type: %d, src0_type: %d, src1_type: %d\n", t2->type, t0->type, t1->type);
+    }*/
+    
+    //printf("%p, %p, %p\n", t0, t1, t2);
+    
+    // HERE HERE HERE HERE
+#ifdef GGML_USE_ONEDNN
+    //printf("tensor->op = %d\nopname: %s\n", tensor->op, (ggml_op_str[tensor->op] ? : ""));
+#endif
 
     switch (tensor->op) {
         case GGML_OP_DUP:
@@ -18825,6 +18905,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     GGML_ASSERT(cplan->n_threads > 0);
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
 
+    // HERE HERE HERE ONEDNN onednn nthread nth
+    cplan->n_threads = 1;
     int n_threads = cplan->n_threads;
 
     struct ggml_compute_state_shared state_shared = {
@@ -18839,7 +18921,15 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         /*.ec                      =*/ GGML_STATUS_SUCCESS,
     };
 
+    // HERE HERE HERE HERE
+#ifdef GGML_USE_ONEDNN
+    /*if (ggml_try_graph_compute_onednn(cgraph, cplan)){
+        return GGML_STATUS_SUCCESS;
+    }*/
+#endif
+
 #ifdef GGML_USE_OPENMP
+    //printf("Using openmp...\n");
     if (n_threads > 1) {
         #pragma omp parallel num_threads(n_threads)
         {
@@ -18895,6 +18985,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         }
     }
 #endif
+
+    printf("\nInferrence complete\n");
 
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();

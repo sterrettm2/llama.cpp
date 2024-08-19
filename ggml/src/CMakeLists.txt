@@ -139,6 +139,21 @@ if (GGML_METAL)
         )
 endif()
 
+# Use oneDNN for the computation backend
+if (GGML_ONEDNN)
+    find_library(DNNL_LIBRARY dnnl)
+    if (NOT DNNL_LIBRARY)
+        message(WARNING "oneDNN wasn't found but was enabled, oneDNN will not be used")
+        set(GGML_ONEDNN OFF)
+    else()
+        add_compile_definitions(GGML_USE_ONEDNN)
+        set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} ${DNNL_LIBRARY})
+
+        set(GGML_HEADERS_ONEDNN ggml-onednn.h)
+        set(GGML_SOURCES_ONEDNN ggml-onednn.cpp)
+    endif()
+endif ()
+
 if (GGML_OPENMP)
     find_package(OpenMP)
     if (OpenMP_FOUND)
@@ -1253,6 +1268,7 @@ add_library(ggml
             ${GGML_SOURCES_BLAS}      ${GGML_HEADERS_BLAS}
             ${GGML_SOURCES_LLAMAFILE} ${GGML_HEADERS_LLAMAFILE}
             ${GGML_SOURCES_CANN}      ${GGML_HEADERS_CANN}
+            ${GGML_SOURCES_ONEDNN}    ${GGML_HEADERS_ONEDNN}
             ggml-aarch64.c            ggml-aarch64.h
             )
 

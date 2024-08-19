@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.14) # for add_link_options and implicit target 
 project("ggml" C CXX)
 include(CheckIncludeFileCXX)
 
+# HERE HERE HERE
+add_definitions(-w)
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 if (NOT XCODE AND NOT MSVC AND NOT CMAKE_BUILD_TYPE)
@@ -145,6 +148,8 @@ option(GGML_SYCL                            "ggml: use SYCL"                    
 option(GGML_SYCL_F16                        "ggml: use 16 bit floats for sycl calculations"   OFF)
 set   (GGML_SYCL_TARGET "INTEL" CACHE STRING
                                             "ggml: sycl target device")
+                                            
+option(GGML_ONEDNN                          "ggml: use oneDNN to accelerate operations" ON)
 
 # extra artifacts
 option(GGML_BUILD_TESTS    "ggml: build tests"    ${GGML_STANDALONE})
